@@ -3,26 +3,21 @@ import argparse
 import os
 import csv
 import json
-import time
-import requests
 import warnings
-from pathlib import Path
 from typing import List, Dict
 from PIL import Image
 import cv2
 import torch
 import easyocr
 import re
+from card_name_resolver import CardNameResolver
 
 # Suppress noisy warnings
 warnings.filterwarnings("ignore", message=".*pin_memory.*")
 
 class PokemonImageScanner:
-    def __init__(self, offline_mode: bool = False):
+    def __init__(self, offline_mode: bool = False, api_key: str = None):
         self.offline_mode = offline_mode
-        self.api_base_url = "https://api.pokemontcg.io/v2/cards"
-        self.last_api_call = 0
-        self.api_delay = 0.5
         use_mps = torch.backends.mps.is_available()
         self.reader = easyocr.Reader(['en'], gpu=use_mps)
         if use_mps:
@@ -31,6 +26,7 @@ class PokemonImageScanner:
             print("⚠️ MPS not available, using CPU")
         self.card_database = {}
         self.load_card_database()
+        self.resolver = CardNameResolver(api_key=api_key, offline=offline_mode)
 
     def load_card_database(self):
         if os.path.exists("card_database.json"):
@@ -71,7 +67,6 @@ class PokemonImageScanner:
         return card_paths
 
     def _ocr_region(self, image, y1_ratio, y2_ratio, x1_ratio, x2_ratio):
-        """Helper to crop and OCR a region of the card."""
         h, w, _ = image.shape
         y1 = int(h * y1_ratio)
         y2 = int(h * y2_ratio)
@@ -82,29 +77,24 @@ class PokemonImageScanner:
         return [txt for (_, txt, conf) in results if conf > 0.4]
 
     def _clean_name(self, raw_name: str) -> str:
-        """Cleanup common OCR mistakes in names."""
         name = raw_name
-        # Common misreads
         name = name.replace("VzX", "V").replace("Vzax", "V")
         name = re.sub(r"Ggantamax", "Gigantamax", name, flags=re.IGNORECASE)
         name = name.replace("@", "").strip()
-        # Collapse multiple spaces
         name = re.sub(r"\s+", " ", name)
-        # Capitalize first letter of each word
         name = " ".join([w.capitalize() for w in name.split()])
         return name
 
     def extract_card_text(self, card_image_path: str) -> dict:
-        """Extract Pokémon name, card number, and HP from image."""
         img_cv = cv2.imread(card_image_path)
         if img_cv is None:
             return {"name": "", "card_number": "", "hp": ""}
 
-        # Name (taller to catch suffix logos)
         name_texts = self._ocr_region(img_cv, 0.045, 0.16, 0.08, 0.92)
-        name = self._clean_name(" ".join(name_texts).strip())
+        raw_name = " ".join(name_texts).strip()
+        name = self._clean_name(raw_name)
+        name = self.resolver.resolve(name)
 
-        # Card number (bottom right)
         num_texts = self._ocr_region(img_cv, 0.87, 0.96, 0.60, 0.92)
         card_number = ""
         for t in num_texts:
@@ -112,7 +102,6 @@ class PokemonImageScanner:
                 card_number = t.strip()
                 break
 
-        # HP (top right small box)
         hp_texts = self._ocr_region(img_cv, 0.045, 0.12, 0.80, 0.95)
         hp = ""
         for t in hp_texts:
@@ -125,21 +114,6 @@ class PokemonImageScanner:
             "card_number": card_number,
             "hp": hp
         }
-
-    def query_card_api(self, query: str) -> dict:
-        """Query the Pokémon TCG API using a custom query string."""
-        elapsed = time.time() - self.last_api_call
-        if elapsed < self.api_delay:
-            time.sleep(self.api_delay - elapsed)
-        self.last_api_call = time.time()
-
-        url = f"{self.api_base_url}?q={query}"
-        r = requests.get(url)
-        if r.status_code == 200:
-            data = r.json().get("data", [])
-            if data:
-                return data[0]
-        return {}
 
     def process_cards(self, image_path: str, output_dir: str) -> List[Dict]:
         card_paths = self.split_image_3x3(image_path, output_dir)
@@ -163,19 +137,13 @@ class PokemonImageScanner:
             }
 
             if not self.offline_mode and ocr_data["name"]:
-                query_parts = [f'name:"{ocr_data["name"]}"']
-                if ocr_data["card_number"]:
-                    query_parts.append(f'number:"{ocr_data["card_number"].split("/")[0]}"')
-                query_str = " ".join(query_parts)
-
-                api_data = self.query_card_api(query_str)
-                if api_data:
-                    # Overwrite with API clean data
-                    card_info["name"] = api_data.get("name", card_info["name"])
-                    card_info["hp"] = api_data.get("hp", card_info["hp"])
-                    card_info["set_name"] = api_data.get("set", {}).get("name", "")
-                    card_info["card_type"] = ", ".join(api_data.get("types", []))
-                    prices = api_data.get("tcgplayer", {}).get("prices", {})
+                details = self.resolver.fetch_card_details(ocr_data["name"], ocr_data["card_number"])
+                if details:
+                    card_info["name"] = details.get("name", card_info["name"])
+                    card_info["hp"] = details.get("hp", card_info["hp"])
+                    card_info["set_name"] = details.get("set", {}).get("name", "")
+                    card_info["card_type"] = ", ".join(details.get("types", []))
+                    prices = details.get("tcgplayer", {}).get("prices", {})
                     if prices:
                         first_price = list(prices.values())[0]
                         card_info["market_price"] = first_price.get("market", "")
@@ -196,13 +164,14 @@ class PokemonImageScanner:
         print(f"CSV saved to: {output_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Pokemon Card Scanner with EasyOCR (Triple OCR)")
+    parser = argparse.ArgumentParser(description="Pokemon Card Scanner with EasyOCR + Resolver")
     parser.add_argument("input_image", help="Path to input image (3x3 grid)")
     parser.add_argument("output_dir", help="Output directory")
     parser.add_argument("--offline", action="store_true", help="Run without API")
+    parser.add_argument("--api_key", help="Pokémon TCG API key (optional)")
     args = parser.parse_args()
 
-    scanner = PokemonImageScanner(offline_mode=args.offline)
+    scanner = PokemonImageScanner(offline_mode=args.offline, api_key=args.api_key)
     print(f"Processing: {args.input_image} (Offline: {args.offline})")
     card_data = scanner.process_cards(args.input_image, args.output_dir)
     if card_data:
