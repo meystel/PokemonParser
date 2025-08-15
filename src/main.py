@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Pokemon Card Scanner
-Processes a 3x3 grid of Pokemon cards from a single image.
+Pokemon Card Visual Scanner - Alternative Approach
+Uses image analysis and pattern matching instead of pure OCR
 """
 
 import argparse
@@ -9,23 +9,22 @@ import os
 import csv
 import json
 import time
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import requests
-from PIL import Image
-import pytesseract
+from PIL import Image, ImageDraw
 import cv2
 import numpy as np
 import re
 
 
-class PokemonCardScanner:
+class PokemonVisualScanner:
     def __init__(self, offline_mode: bool = False):
         self.offline_mode = offline_mode
         self.api_base_url = "https://api.pokemontcg.io/v2/cards"
-        # Rate limiting for API calls
         self.last_api_call = 0
-        self.api_delay = 0.1  # 100ms between calls
+        self.api_delay = 0.1
 
     def split_image_3x3(self, image_path: str) -> List[Image.Image]:
         """Split a 3x3 grid image into 9 individual card images."""
@@ -33,20 +32,17 @@ class PokemonCardScanner:
             img = Image.open(image_path)
             width, height = img.size
 
-            # Calculate dimensions for each card
             card_width = width // 3
             card_height = height // 3
 
             cards = []
             for row in range(3):
                 for col in range(3):
-                    # Calculate crop coordinates
                     left = col * card_width
                     top = row * card_height
                     right = left + card_width
                     bottom = top + card_height
 
-                    # Crop the card
                     card = img.crop((left, top, right, bottom))
                     cards.append(card)
 
@@ -56,238 +52,215 @@ class PokemonCardScanner:
             print(f"Error splitting image: {e}")
             return []
 
-    def preprocess_card_image(self, card_image: Image.Image) -> Image.Image:
-        """Preprocess card image for better OCR results."""
-        # Convert PIL to OpenCV format
+    def analyze_card_colors(self, card_image: Image.Image) -> Dict[str, str]:
+        """Analyze card colors to determine type and other characteristics."""
+        # Convert to numpy array for analysis
+        img_array = np.array(card_image)
+
+        # Sample the border area (cards usually have colored borders)
+        height, width = img_array.shape[:2]
+        border_width = min(width, height) // 20
+
+        # Sample top, bottom, left, right borders
+        top_border = img_array[:border_width, :, :]
+        bottom_border = img_array[-border_width:, :, :]
+        left_border = img_array[:, :border_width, :]
+        right_border = img_array[:, -border_width:, :]
+
+        # Combine all border pixels
+        border_pixels = np.concatenate([
+            top_border.reshape(-1, 3),
+            bottom_border.reshape(-1, 3),
+            left_border.reshape(-1, 3),
+            right_border.reshape(-1, 3)
+        ])
+
+        # Calculate dominant colors
+        unique_colors, counts = np.unique(border_pixels, axis=0, return_counts=True)
+
+        # Sort by frequency
+        sorted_indices = np.argsort(counts)[::-1]
+        dominant_colors = unique_colors[sorted_indices][:5]  # Top 5 colors
+
+        # Classify card type based on dominant colors
+        card_type = self.classify_card_type_by_color(dominant_colors)
+
+        return {
+            'dominant_colors': [color.tolist() for color in dominant_colors],
+            'estimated_type': card_type
+        }
+
+    def classify_card_type_by_color(self, colors: np.ndarray) -> str:
+        """Classify Pokemon card type based on border/dominant colors."""
+        # Common Pokemon card type colors (approximate RGB values)
+        type_colors = {
+            'fire': ([255, 100, 100], [200, 50, 50]),  # Red
+            'water': ([100, 150, 255], [50, 100, 200]),  # Blue
+            'grass': ([100, 200, 100], [50, 150, 50]),  # Green
+            'electric': ([255, 255, 100], [200, 200, 50]),  # Yellow
+            'psychic': ([200, 100, 255], [150, 50, 200]),  # Purple
+            'fighting': ([200, 150, 100], [150, 100, 50]),  # Brown
+            'darkness': ([100, 100, 100], [50, 50, 50]),  # Dark gray
+            'metal': ([200, 200, 200], [150, 150, 150]),  # Light gray
+            'fairy': ([255, 200, 255], [200, 150, 200]),  # Pink
+            'dragon': ([255, 200, 100], [200, 150, 50]),  # Gold
+            'colorless': ([240, 240, 240], [200, 200, 200])  # Near white
+        }
+
+        best_match = 'unknown'
+        best_score = float('inf')
+
+        for color in colors[:3]:  # Check top 3 dominant colors
+            for card_type, (target_high, target_low) in type_colors.items():
+                # Calculate distance to both high and low variants
+                dist_high = np.linalg.norm(color - np.array(target_high))
+                dist_low = np.linalg.norm(color - np.array(target_low))
+                dist = min(dist_high, dist_low)
+
+                if dist < best_score:
+                    best_score = dist
+                    best_match = card_type
+
+        return best_match if best_score < 100 else 'unknown'
+
+    def detect_card_features(self, card_image: Image.Image) -> Dict[str, any]:
+        """Detect visual features of the card."""
+        # Convert to OpenCV format
         cv_image = cv2.cvtColor(np.array(card_image), cv2.COLOR_RGB2BGR)
-
-        # Resize image for better OCR (OCR works better on larger images)
-        height, width = cv_image.shape[:2]
-        scale_factor = 2.0
-        new_width = int(width * scale_factor)
-        new_height = int(height * scale_factor)
-        cv_image = cv2.resize(cv_image, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
-
-        # Convert to grayscale
         gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
 
-        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
+        features = {}
 
-        # Noise reduction with bilateral filter (preserves edges better)
-        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+        # Detect if card has holographic/shiny effects
+        features['has_holo_effect'] = self.detect_holographic_effect(gray)
 
-        # Multiple thresholding approaches - we'll return the best one
-        # Method 1: OTSU
-        _, thresh1 = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Detect text regions (even if we can't read them well)
+        features['text_regions'] = self.detect_text_regions(gray)
 
-        # Method 2: Adaptive threshold
-        thresh2 = cv2.adaptiveThreshold(filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                        cv2.THRESH_BINARY, 11, 2)
+        # Calculate image hash for potential matching
+        features['image_hash'] = self.calculate_image_hash(card_image)
 
-        # Method 3: Simple threshold at a higher value (good for white text on dark)
-        _, thresh3 = cv2.threshold(filtered, 150, 255, cv2.THRESH_BINARY)
+        # Analyze card layout
+        features['layout_type'] = self.analyze_card_layout(gray)
 
-        # Choose the best threshold (you can experiment with this)
-        # For now, let's use OTSU as it's generally robust
-        final_thresh = thresh1
+        return features
 
-        # Morphological operations to clean up the image
-        kernel = np.ones((2, 2), np.uint8)
-        final_thresh = cv2.morphologyEx(final_thresh, cv2.MORPH_CLOSE, kernel)
-        final_thresh = cv2.morphologyEx(final_thresh, cv2.MORPH_OPEN, kernel)
+    def detect_holographic_effect(self, gray_image: np.ndarray) -> bool:
+        """Detect if the card has holographic/foil effects."""
+        # Holographic cards often have high variance in pixel intensity
+        # due to reflections and rainbow effects
 
-        # Convert back to PIL
-        return Image.fromarray(final_thresh)
+        # Calculate local variance
+        kernel = np.ones((5, 5), np.float32) / 25
+        mean = cv2.filter2D(gray_image.astype(np.float32), -1, kernel)
+        variance = cv2.filter2D((gray_image.astype(np.float32) - mean) ** 2, -1, kernel)
 
-    def extract_text_from_card(self, card_image: Image.Image) -> str:
-        """Extract text from card image using OCR."""
-        try:
-            # Try multiple preprocessing approaches
-            results = []
+        # High variance regions suggest holographic effects
+        high_variance_threshold = np.percentile(variance, 90)
+        high_variance_pixels = np.sum(variance > high_variance_threshold)
+        total_pixels = variance.size
 
-            # Approach 1: Standard preprocessing
-            processed_image1 = self.preprocess_card_image(card_image)
-            config1 = r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/- '
-            text1 = pytesseract.image_to_string(processed_image1, config=config1).strip()
-            results.append(text1)
+        variance_ratio = high_variance_pixels / total_pixels
+        return variance_ratio > 0.05  # 5% of pixels have high variance
 
-            # Approach 2: Focus on just the top portion (where card name usually is)
-            width, height = card_image.size
-            top_crop = card_image.crop((0, 0, width, height // 3))  # Top third
-            processed_top = self.preprocess_card_image(top_crop)
-            config2 = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz '
-            text2 = pytesseract.image_to_string(processed_top, config=config2).strip()
-            results.append(text2)
+    def detect_text_regions(self, gray_image: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """Detect regions that likely contain text."""
+        # Use MSER (Maximally Stable Extremal Regions) to find text-like regions
+        mser = cv2.MSER_create()
+        regions, _ = mser.detectRegions(gray_image)
 
-            # Approach 3: Try with original image (sometimes works better)
-            config3 = r'--oem 3 --psm 7'
-            text3 = pytesseract.image_to_string(card_image, config=config3).strip()
-            results.append(text3)
+        text_regions = []
+        for region in regions:
+            # Calculate bounding box
+            x, y, w, h = cv2.boundingRect(region.reshape(-1, 1, 2))
 
-            # Approach 4: Focus on bottom area where set info might be
-            bottom_crop = card_image.crop((0, height * 2 // 3, width, height))  # Bottom third
-            processed_bottom = self.preprocess_card_image(bottom_crop)
-            text4 = pytesseract.image_to_string(processed_bottom, config=config1).strip()
-            results.append(text4)
+            # Filter regions that are likely to be text
+            aspect_ratio = w / h if h > 0 else 0
+            area = w * h
 
-            # Combine results, taking the longest reasonable text
-            all_text = "\n".join(results)
-            return all_text
+            # Text regions usually have reasonable aspect ratios and sizes
+            if 0.1 < aspect_ratio < 10 and 100 < area < 5000:
+                text_regions.append((x, y, w, h))
 
-        except Exception as e:
-            print(f"Error extracting text: {e}")
-            return ""
+        return text_regions
 
-    def parse_card_info(self, ocr_text: str) -> Dict[str, str]:
-        """Parse card information from OCR text."""
-        card_info = {
-            'name': '',
-            'number': '',
-            'set': '',
-            'rarity': '',
-            'raw_text': ocr_text
-        }
+    def calculate_image_hash(self, image: Image.Image) -> str:
+        """Calculate a perceptual hash of the card image."""
+        # Resize to small size and convert to grayscale
+        small_image = image.resize((8, 8), Image.LANCZOS).convert('L')
+        pixels = list(small_image.getdata())
 
-        lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
+        # Calculate average
+        avg = sum(pixels) / len(pixels)
 
-        if not lines:
-            return card_info
+        # Create hash based on whether each pixel is above/below average
+        hash_bits = ''.join(['1' if pixel > avg else '0' for pixel in pixels])
 
-        # Find the most likely card name (usually the cleanest, longest line in the first few lines)
-        potential_names = []
-        for i, line in enumerate(lines[:5]):  # Look at first 5 lines
-            # Clean up the line
-            cleaned = re.sub(r'[^A-Za-z\s]', '', line).strip()
-            # Skip very short or very long lines, or lines with too many spaces
-            if 3 <= len(cleaned) <= 25 and cleaned.count(' ') <= 3:
-                potential_names.append((cleaned, len(cleaned)))
+        # Convert to hex
+        hash_hex = hex(int(hash_bits, 2))[2:].zfill(16)
+        return hash_hex
 
-        if potential_names:
-            # Choose the longest reasonable name
-            card_info['name'] = max(potential_names, key=lambda x: x[1])[0]
+    def analyze_card_layout(self, gray_image: np.ndarray) -> str:
+        """Analyze the overall layout of the card."""
+        height, width = gray_image.shape
 
-        # Look for card numbers with better patterns
-        number_patterns = [
-            r'(\d{1,3})/(\d{1,3})',  # 123/456 format
-            r'(\d{1,3})\s*/\s*(\d{1,3})',  # 123 / 456 with spaces
-            r'#(\d{1,3})',  # #123 format
-            r'No\.?\s*(\d{1,3})',  # No. 123 format
-        ]
+        # Divide into regions and analyze
+        top_region = gray_image[:height // 3, :]
+        middle_region = gray_image[height // 3:2 * height // 3, :]
+        bottom_region = gray_image[2 * height // 3:, :]
 
-        for line in lines:
-            for pattern in number_patterns:
-                match = re.search(pattern, line)
-                if match:
-                    if len(match.groups()) >= 2 and match.group(2):
-                        card_info['number'] = f"{match.group(1)}/{match.group(2)}"
-                    else:
-                        card_info['number'] = match.group(1)
-                    break
-            if card_info['number']:
-                break
+        # Calculate average intensity for each region
+        top_avg = np.mean(top_region)
+        middle_avg = np.mean(middle_region)
+        bottom_avg = np.mean(bottom_region)
 
-        # Look for set information (common set abbreviations)
-        set_patterns = [
-            r'\b(BS|JU|FO|TR|GS|LC|AQ|SK|EX|DP|PL|HS|BW|XY|SM|SW|SH)\b',
-            r'\b(Base|Jungle|Fossil|Rocket|Gym|Neo|Legend|Aquapolis|Skyridge)\b',
-        ]
+        # Classify based on intensity distribution
+        if middle_avg < top_avg and middle_avg < bottom_avg:
+            return 'pokemon_card'  # Typical Pokemon card has darker middle (artwork)
+        elif top_avg > middle_avg > bottom_avg:
+            return 'trainer_card'  # Might be a trainer card
+        else:
+            return 'unknown_layout'
 
-        for line in lines:
-            line_upper = line.upper()
-            for pattern in set_patterns:
-                match = re.search(pattern, line_upper)
-                if match:
-                    card_info['set'] = match.group(1)
-                    break
-            if card_info['set']:
-                break
-
-        # Look for rarity indicators
-        rarity_patterns = {
-            'common': r'\b(COMMON|C)\b',
-            'uncommon': r'\b(UNCOMMON|UC|U)\b',
-            'rare': r'\b(RARE|R)\b',
-            'holo': r'\b(HOLO|HOLOGRAPHIC)\b',
-            'ultra': r'\b(ULTRA|UR)\b',
-            'secret': r'\b(SECRET|SR)\b',
-            'promo': r'\b(PROMO|P)\b'
-        }
-
-        for line in lines:
-            line_upper = line.upper()
-            for rarity, pattern in rarity_patterns.items():
-                if re.search(pattern, line_upper):
-                    card_info['rarity'] = rarity
-                    break
-            if card_info['rarity']:
-                break
-
-        return card_info
-
-    def get_card_price(self, card_name: str, card_number: str = "") -> Optional[Dict]:
-        """Get card price from Pokemon TCG API."""
+    def search_card_by_features(self, features: Dict) -> Optional[Dict]:
+        """Search for card using visual features instead of OCR text."""
         if self.offline_mode:
             return None
 
         try:
-            # Rate limiting
-            current_time = time.time()
-            if current_time - self.last_api_call < self.api_delay:
-                time.sleep(self.api_delay)
-            self.last_api_call = time.time()
+            # For now, we'll do a broad search and let the user manually verify
+            # In a real implementation, you might:
+            # 1. Use image similarity matching
+            # 2. Build a database of card hashes
+            # 3. Use machine learning for card recognition
 
-            # Build query
-            query = f'name:"{card_name}"'
-            if card_number:
-                query += f' number:{card_number.split("/")[0]}'
-
-            params = {
-                'q': query,
-                'select': 'name,number,set,cardmarket'
-            }
-
-            response = requests.get(self.api_base_url, params=params, timeout=10)
-            response.raise_for_status()
-
-            data = response.json()
-
-            if data.get('data') and len(data['data']) > 0:
-                card = data['data'][0]  # Take first match
-
-                price_info = {
-                    'api_name': card.get('name', ''),
-                    'api_number': card.get('number', ''),
-                    'api_set': card.get('set', {}).get('name', ''),
-                    'market_price': 0.0,
-                    'low_price': 0.0,
-                    'high_price': 0.0
+            # Search for cards of the detected type
+            estimated_type = features.get('estimated_type', '')
+            if estimated_type and estimated_type != 'unknown':
+                params = {
+                    'q': f'types:{estimated_type}',
+                    'select': 'name,number,set,types,cardmarket',
+                    'pageSize': 5  # Just get a few examples
                 }
 
-                # Extract price information
-                cardmarket = card.get('cardmarket', {})
-                if cardmarket:
-                    prices = cardmarket.get('prices', {})
-                    price_info['market_price'] = prices.get('averageSellPrice', 0.0) or 0.0
-                    price_info['low_price'] = prices.get('lowPrice', 0.0) or 0.0
-                    price_info['high_price'] = prices.get('highPrice', 0.0) or 0.0
+                response = requests.get(self.api_base_url, params=params, timeout=10)
+                response.raise_for_status()
 
-                return price_info
+                data = response.json()
+                if data.get('data'):
+                    # Return the first match as an example
+                    # In practice, you'd want better matching logic
+                    return data['data'][0]
 
-        except requests.exceptions.RequestException as e:
-            print(f"API request failed for {card_name}: {e}")
         except Exception as e:
-            print(f"Error getting price for {card_name}: {e}")
+            print(f"Error searching by features: {e}")
 
         return None
 
     def process_cards(self, image_path: str, output_dir: str) -> List[Dict]:
-        """Process all cards from the input image."""
-        # Create output directory
+        """Process all cards using visual analysis instead of OCR."""
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-        # Split image into individual cards
         print("Splitting image into individual cards...")
         cards = self.split_image_3x3(image_path)
 
@@ -298,38 +271,47 @@ class PokemonCardScanner:
         results = []
 
         for i, card_image in enumerate(cards, 1):
-            print(f"Processing card {i}/9...")
+            print(f"Analyzing card {i}/9...")
 
             # Save cropped card image
             card_filename = f"card_{i:02d}.jpg"
             card_path = os.path.join(output_dir, card_filename)
             card_image.save(card_path, 'JPEG', quality=95)
 
-            # Extract text using OCR
-            ocr_text = self.extract_text_from_card(card_image)
+            # Analyze visual features instead of OCR
+            color_analysis = self.analyze_card_colors(card_image)
+            visual_features = self.detect_card_features(card_image)
 
-            # Parse card information
-            card_info = self.parse_card_info(ocr_text)
+            # Combine all analysis
+            card_info = {
+                'card_number': i,
+                'image_file': card_filename,
+                'estimated_type': color_analysis['estimated_type'],
+                'has_holo_effect': visual_features['has_holo_effect'],
+                'layout_type': visual_features['layout_type'],
+                'image_hash': visual_features['image_hash'],
+                'text_regions_count': len(visual_features['text_regions']),
+                'dominant_colors': str(color_analysis['dominant_colors']),
+                'name': f'Unknown Card {i}',  # Placeholder
+                'number': '',
+                'set': '',
+                'rarity': 'holo' if visual_features['has_holo_effect'] else 'unknown'
+            }
 
-            # Add metadata
-            card_info['card_number'] = i
-            card_info['image_file'] = card_filename
+            # Try to get additional info if online
+            if not self.offline_mode:
+                print(f"  Searching for {color_analysis['estimated_type']} type cards...")
+                api_result = self.search_card_by_features({
+                    'estimated_type': color_analysis['estimated_type'],
+                    'has_holo_effect': visual_features['has_holo_effect']
+                })
 
-            # Get price information if in online mode
-            if not self.offline_mode and card_info['name']:
-                print(f"  Getting price for: {card_info['name']}")
-                price_info = self.get_card_price(card_info['name'], card_info['number'])
-                if price_info:
-                    card_info.update(price_info)
-                else:
-                    # Add empty price fields
+                if api_result:
                     card_info.update({
-                        'api_name': '',
-                        'api_number': '',
-                        'api_set': '',
-                        'market_price': 0.0,
-                        'low_price': 0.0,
-                        'high_price': 0.0
+                        'api_suggestion_name': api_result.get('name', ''),
+                        'api_suggestion_number': api_result.get('number', ''),
+                        'api_suggestion_set': api_result.get('set', {}).get('name', ''),
+                        'market_price': 0.0,  # Would need specific card lookup
                     })
 
             results.append(card_info)
@@ -337,18 +319,18 @@ class PokemonCardScanner:
         return results
 
     def save_to_csv(self, card_data: List[Dict], output_path: str):
-        """Save card data to CSV file."""
+        """Save card analysis to CSV file."""
         if not card_data:
             print("No card data to save")
             return
 
-        # Define CSV headers based on available data
-        headers = ['card_number', 'image_file', 'name', 'number', 'set', 'rarity']
+        headers = [
+            'card_number', 'image_file', 'estimated_type', 'has_holo_effect',
+            'layout_type', 'text_regions_count', 'rarity', 'image_hash'
+        ]
 
         if not self.offline_mode:
-            headers.extend(['api_name', 'api_number', 'api_set', 'market_price', 'low_price', 'high_price'])
-
-        headers.append('raw_text')
+            headers.extend(['api_suggestion_name', 'api_suggestion_number', 'api_suggestion_set'])
 
         try:
             with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
@@ -356,7 +338,6 @@ class PokemonCardScanner:
                 writer.writeheader()
 
                 for card in card_data:
-                    # Ensure all fields exist
                     row = {header: card.get(header, '') for header in headers}
                     writer.writerow(row)
 
@@ -367,43 +348,48 @@ class PokemonCardScanner:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Pokemon Card Scanner')
+    parser = argparse.ArgumentParser(description='Pokemon Card Visual Scanner')
     parser.add_argument('input_image', help='Path to input image (3x3 grid of Pokemon cards)')
     parser.add_argument('output_dir', help='Output directory for cropped images and CSV')
     parser.add_argument('--offline', action='store_true',
-                        help='Run in offline mode (no API calls for pricing)')
+                        help='Run in offline mode (no API calls)')
 
     args = parser.parse_args()
 
-    # Validate input file
     if not os.path.exists(args.input_image):
         print(f"Error: Input image '{args.input_image}' not found")
         return 1
 
-    # Initialize scanner
-    scanner = PokemonCardScanner(offline_mode=args.offline)
+    scanner = PokemonVisualScanner(offline_mode=args.offline)
 
     print(f"Processing image: {args.input_image}")
     print(f"Output directory: {args.output_dir}")
     print(f"Mode: {'Offline' if args.offline else 'Online'}")
+    print("Note: This version uses visual analysis instead of OCR")
 
-    # Process cards
     card_data = scanner.process_cards(args.input_image, args.output_dir)
 
     if card_data:
-        # Save results to CSV
-        csv_path = os.path.join(args.output_dir, 'pokemon_cards.csv')
+        csv_path = os.path.join(args.output_dir, 'pokemon_cards_visual.csv')
         scanner.save_to_csv(card_data, csv_path)
 
         print(f"\nProcessing complete!")
-        print(f"Processed {len(card_data)} cards")
+        print(f"Analyzed {len(card_data)} cards")
         print(f"Images saved to: {args.output_dir}")
-        print(f"CSV saved to: {csv_path}")
+        print(f"Analysis saved to: {csv_path}")
 
-        # Show summary
-        if not args.offline:
-            total_value = sum(card.get('market_price', 0) for card in card_data)
-            print(f"Total estimated value: ${total_value:.2f}")
+        # Show summary of detected types
+        type_counts = {}
+        holo_count = 0
+        for card in card_data:
+            card_type = card.get('estimated_type', 'unknown')
+            type_counts[card_type] = type_counts.get(card_type, 0) + 1
+            if card.get('has_holo_effect'):
+                holo_count += 1
+
+        print(f"\nDetected card types: {dict(type_counts)}")
+        print(f"Holographic cards detected: {holo_count}")
+        print(f"\nNote: Card names need manual verification or better image recognition")
     else:
         print("No cards processed successfully")
         return 1
