@@ -73,8 +73,17 @@ class PokemonImageScanner:
         x1 = int(w * x1_ratio)
         x2 = int(w * x2_ratio)
         region = image[y1:y2, x1:x2]
-        results = self.reader.readtext(region)
-        return [txt for (_, txt, conf) in results if conf > 0.4]
+
+        # Preprocess: grayscale + contrast boost + light blur
+        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        enhanced = cv2.convertScaleAbs(gray, alpha=1.6, beta=20)  # contrast/brightness
+        blurred = cv2.GaussianBlur(enhanced, (1, 1), 0)
+
+        # Run OCR
+        results = self.reader.readtext(blurred)
+
+        # Lower confidence threshold slightly for tricky fonts
+        return [txt for (_, txt, conf) in results if conf > 0.3]
 
     def _clean_name(self, raw_name: str) -> str:
         name = raw_name
