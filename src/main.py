@@ -10,6 +10,9 @@ from typing import List, Dict
 from PIL import Image
 import cv2
 import easyocr
+import torch
+import warnings
+warnings.filterwarnings("ignore", message=".*pin_memory.*")
 
 class PokemonImageScanner:
     def __init__(self, offline_mode: bool = False):
@@ -17,7 +20,13 @@ class PokemonImageScanner:
         self.api_base_url = "https://api.pokemontcg.io/v2/cards"
         self.last_api_call = 0
         self.api_delay = 0.5
-        self.reader = easyocr.Reader(['en'], gpu=False)
+        #self.reader = easyocr.Reader(['en'], gpu=False)
+        use_mps = torch.backends.mps.is_available()
+        self.reader = easyocr.Reader(['en'], gpu=use_mps)
+        if use_mps:
+            print("✅ Using Apple GPU (MPS) for OCR")
+        else:
+            print("⚠️ MPS not available, using CPU")
         self.card_database = {}
         self.load_card_database()
 
