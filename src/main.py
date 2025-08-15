@@ -74,16 +74,20 @@ class PokemonImageScanner:
         x2 = int(w * x2_ratio)
         region = image[y1:y2, x1:x2]
 
-        # Preprocess: grayscale + contrast boost + light blur
+        # Preprocess: grayscale + adaptive thresholding (good for shiny backgrounds)
         gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-        enhanced = cv2.convertScaleAbs(gray, alpha=1.6, beta=20)  # contrast/brightness
-        blurred = cv2.GaussianBlur(enhanced, (1, 1), 0)
+        thresh = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            11, 2
+        )
 
         # Run OCR
-        results = self.reader.readtext(blurred)
+        results = self.reader.readtext(thresh)
 
-        # Lower confidence threshold slightly for tricky fonts
-        return [txt for (_, txt, conf) in results if conf > 0.3]
+        # Keep confidence filter at 0.4 to reduce junk
+        return [txt for (_, txt, conf) in results if conf > 0.4]
 
     def _clean_name(self, raw_name: str) -> str:
         name = raw_name
@@ -99,19 +103,22 @@ class PokemonImageScanner:
         if img_cv is None:
             return {"name": "", "card_number": "", "hp": ""}
 
-        name_texts = self._ocr_region(img_cv, 0.045, 0.16, 0.08, 0.92)
+        # OCR for card name (tighter crop, just under top border)
+        name_texts = self._ocr_region(img_cv, 0.055, 0.125, 0.10, 0.85)
         raw_name = " ".join(name_texts).strip()
         name = self._clean_name(raw_name)
         name = self.resolver.resolve(name)
 
-        num_texts = self._ocr_region(img_cv, 0.87, 0.96, 0.60, 0.92)
+        # OCR for card number (bottom-right tighter window)
+        num_texts = self._ocr_region(img_cv, 0.90, 0.97, 0.65, 0.93)
         card_number = ""
         for t in num_texts:
             if "/" in t:
                 card_number = t.strip()
                 break
 
-        hp_texts = self._ocr_region(img_cv, 0.045, 0.12, 0.80, 0.95)
+        # OCR for HP (top-right)
+        hp_texts = self._ocr_region(img_cv, 0.045, 0.11, 0.75, 0.95)
         hp = ""
         for t in hp_texts:
             if t.isdigit():
