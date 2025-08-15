@@ -74,20 +74,24 @@ class PokemonImageScanner:
         x2 = int(w * x2_ratio)
         region = image[y1:y2, x1:x2]
 
-        # Preprocess: grayscale + adaptive thresholding (good for shiny backgrounds)
+        # Pass 1: normal grayscale
         gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        results = self.reader.readtext(gray)
+        texts = [txt for (_, txt, conf) in results if conf > 0.4]
+
+        if texts:
+            return texts
+
+        # Pass 2: adaptive threshold (for shiny/foil cards)
         thresh = cv2.adaptiveThreshold(
             gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
             11, 2
         )
-
-        # Run OCR
         results = self.reader.readtext(thresh)
+        return [txt for (_, txt, conf) in results if conf > 0.35]
 
-        # Keep confidence filter at 0.4 to reduce junk
-        return [txt for (_, txt, conf) in results if conf > 0.4]
 
     def _clean_name(self, raw_name: str) -> str:
         name = raw_name
@@ -131,41 +135,55 @@ class PokemonImageScanner:
             "hp": hp
         }
 
-    def process_cards(self, image_path: str, output_dir: str) -> List[Dict]:
-        card_paths = self.split_image_3x3(image_path, output_dir)
-        all_cards = []
-        for idx, card_path in enumerate(card_paths, start=1):
-            print(f"Processing {card_path}...")
-            ocr_data = self.extract_card_text(card_path)
+    def extract_card_text(self, card_image_path: str) -> dict:
+        img_cv = cv2.imread(card_image_path)
+        if img_cv is None:
+            return {"name": "", "card_number": "", "hp": ""}
 
-            card_info = {
-                "card_number": ocr_data["card_number"],
-                "image_file": os.path.basename(card_path),
-                "name": ocr_data["name"] or "Unknown",
-                "hp": ocr_data["hp"],
-                "set_name": "",
-                "card_type": "",
-                "market_price": "",
-                "similarity_score": "",
-                "perceptual_hash": "",
-                "edge_density": "",
-                "dominant_colors": ""
-            }
+        # === Card name (original crop ratios) ===
+        name_texts = self._ocr_region(img_cv, 0.045, 0.16, 0.08, 0.92)
+        raw_name = " ".join(name_texts).strip()
 
-            if not self.offline_mode and ocr_data["name"]:
-                details = self.resolver.fetch_card_details(ocr_data["name"], ocr_data["card_number"])
-                if details:
-                    card_info["name"] = details.get("name", card_info["name"])
-                    card_info["hp"] = details.get("hp", card_info["hp"])
-                    card_info["set_name"] = details.get("set", {}).get("name", "")
-                    card_info["card_type"] = ", ".join(details.get("types", []))
-                    prices = details.get("tcgplayer", {}).get("prices", {})
-                    if prices:
-                        first_price = list(prices.values())[0]
-                        card_info["market_price"] = first_price.get("market", "")
+        if not raw_name:
+            print(f"[DEBUG] No name detected in {os.path.basename(card_image_path)}")
+        else:
+            print(f"[DEBUG] OCR name candidates for {os.path.basename(card_image_path)}: {name_texts}")
 
-            all_cards.append(card_info)
-        return all_cards
+        name = self._clean_name(raw_name)
+        name = self.resolver.resolve(name)
+
+        # === Card number (bottom-right) ===
+        num_texts = self._ocr_region(img_cv, 0.87, 0.96, 0.60, 0.92)
+        card_number = ""
+        for t in num_texts:
+            if "/" in t:
+                card_number = t.strip()
+                break
+
+        if not card_number:
+            print(f"[DEBUG] No card number detected in {os.path.basename(card_image_path)}")
+        else:
+            print(f"[DEBUG] OCR number candidates for {os.path.basename(card_image_path)}: {num_texts}")
+
+        # === HP (top-right) ===
+        hp_texts = self._ocr_region(img_cv, 0.045, 0.12, 0.80, 0.95)
+        hp = ""
+        for t in hp_texts:
+            if t.isdigit():
+                hp = t
+                break
+
+        if not hp:
+            print(f"[DEBUG] No HP detected in {os.path.basename(card_image_path)}")
+        else:
+            print(f"[DEBUG] OCR HP candidates for {os.path.basename(card_image_path)}: {hp_texts}")
+
+        return {
+            "name": name,
+            "card_number": card_number,
+            "hp": hp
+        }
+
 
     def save_to_csv(self, card_data: List[Dict], output_path: str):
         if not card_data:
