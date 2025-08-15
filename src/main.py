@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Pokemon Card Visual Scanner - Alternative Approach
-Uses image analysis and pattern matching instead of pure OCR
+Pokemon Card Scanner - Image Matching Approach
+Uses image hashing and API image matching instead of OCR for reliable card identification
 """
 
 import argparse
@@ -13,18 +13,44 @@ import hashlib
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import requests
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 import cv2
 import numpy as np
 import re
+from urllib.parse import quote
+import base64
+import io
 
 
-class PokemonVisualScanner:
+class PokemonImageScanner:
     def __init__(self, offline_mode: bool = False):
         self.offline_mode = offline_mode
         self.api_base_url = "https://api.pokemontcg.io/v2/cards"
         self.last_api_call = 0
-        self.api_delay = 0.1
+        self.api_delay = 0.5  # Slower to be nice to API
+
+        # Card database for offline matching (you'd populate this)
+        self.card_database = {}
+        self.load_card_database()
+
+    def load_card_database(self):
+        """Load local card database if available."""
+        db_file = "card_database.json"
+        if os.path.exists(db_file):
+            try:
+                with open(db_file, 'r') as f:
+                    self.card_database = json.load(f)
+                print(f"Loaded {len(self.card_database)} cards from local database")
+            except Exception as e:
+                print(f"Error loading card database: {e}")
+
+    def save_card_database(self):
+        """Save card database for future use."""
+        try:
+            with open("card_database.json", 'w') as f:
+                json.dump(self.card_database, f, indent=2)
+        except Exception as e:
+            print(f"Error saving card database: {e}")
 
     def split_image_3x3(self, image_path: str) -> List[Image.Image]:
         """Split a 3x3 grid image into 9 individual card images."""
@@ -52,213 +78,303 @@ class PokemonVisualScanner:
             print(f"Error splitting image: {e}")
             return []
 
-    def analyze_card_colors(self, card_image: Image.Image) -> Dict[str, str]:
-        """Analyze card colors to determine type and other characteristics."""
-        # Convert to numpy array for analysis
-        img_array = np.array(card_image)
+    def preprocess_card_for_matching(self, card_image: Image.Image) -> Image.Image:
+        """Preprocess card image for better feature matching."""
+        try:
+            # Convert to RGB if needed
+            if card_image.mode != 'RGB':
+                card_image = card_image.convert('RGB')
 
-        # Sample the border area (cards usually have colored borders)
-        height, width = img_array.shape[:2]
-        border_width = min(width, height) // 20
+            # Resize to standard size for consistent matching
+            standard_size = (400, 560)  # Approximate Pokemon card ratio
+            resized = card_image.resize(standard_size, Image.LANCZOS)
 
-        # Sample top, bottom, left, right borders
-        top_border = img_array[:border_width, :, :]
-        bottom_border = img_array[-border_width:, :, :]
-        left_border = img_array[:, :border_width, :]
-        right_border = img_array[:, -border_width:, :]
+            # Apply slight blur to reduce noise and holographic interference
+            blurred = resized.filter(ImageFilter.GaussianBlur(0.5))
 
-        # Combine all border pixels
-        border_pixels = np.concatenate([
-            top_border.reshape(-1, 3),
-            bottom_border.reshape(-1, 3),
-            left_border.reshape(-1, 3),
-            right_border.reshape(-1, 3)
-        ])
+            return blurred
 
-        # Calculate dominant colors
-        unique_colors, counts = np.unique(border_pixels, axis=0, return_counts=True)
+        except Exception as e:
+            print(f"Error preprocessing card: {e}")
+            return card_image
 
-        # Sort by frequency
-        sorted_indices = np.argsort(counts)[::-1]
-        dominant_colors = unique_colors[sorted_indices][:5]  # Top 5 colors
+    def calculate_perceptual_hash(self, image: Image.Image, hash_size: int = 16) -> str:
+        """Calculate a more robust perceptual hash."""
+        try:
+            # Convert to grayscale
+            gray = image.convert('L')
 
-        # Classify card type based on dominant colors
-        card_type = self.classify_card_type_by_color(dominant_colors)
+            # Resize to hash_size x hash_size
+            resized = gray.resize((hash_size, hash_size), Image.LANCZOS)
 
-        return {
-            'dominant_colors': [color.tolist() for color in dominant_colors],
-            'estimated_type': card_type
+            # Get pixel data
+            pixels = list(resized.getdata())
+
+            # Calculate average
+            avg = sum(pixels) / len(pixels)
+
+            # Create hash
+            hash_bits = []
+            for pixel in pixels:
+                hash_bits.append('1' if pixel > avg else '0')
+
+            # Convert to hex string
+            hash_str = ''.join(hash_bits)
+            hash_int = int(hash_str, 2)
+            hash_hex = format(hash_int, 'x').zfill(hash_size * hash_size // 4)
+
+            return hash_hex
+
+        except Exception as e:
+            print(f"Error calculating hash: {e}")
+            return ""
+
+    def calculate_color_histogram(self, image: Image.Image) -> List[float]:
+        """Calculate color histogram for image similarity."""
+        try:
+            # Convert to RGB
+            rgb_image = image.convert('RGB')
+
+            # Calculate histogram for each channel
+            hist_r = rgb_image.histogram()[0:256]
+            hist_g = rgb_image.histogram()[256:512]
+            hist_b = rgb_image.histogram()[512:768]
+
+            # Normalize histograms
+            total_pixels = sum(hist_r)
+            if total_pixels > 0:
+                hist_r = [x / total_pixels for x in hist_r]
+                hist_g = [x / total_pixels for x in hist_g]
+                hist_b = [x / total_pixels for x in hist_b]
+
+            # Combine into single feature vector (downsample to reduce size)
+            combined_hist = []
+            step = 8  # Reduce 256 bins to 32 bins per channel
+            for i in range(0, 256, step):
+                combined_hist.append(sum(hist_r[i:i + step]))
+                combined_hist.append(sum(hist_g[i:i + step]))
+                combined_hist.append(sum(hist_b[i:i + step]))
+
+            return combined_hist
+
+        except Exception as e:
+            print(f"Error calculating histogram: {e}")
+            return []
+
+    def extract_card_features(self, card_image: Image.Image) -> Dict:
+        """Extract multiple features for card identification."""
+        processed_card = self.preprocess_card_for_matching(card_image)
+
+        features = {
+            'perceptual_hash': self.calculate_perceptual_hash(processed_card),
+            'color_histogram': self.calculate_color_histogram(processed_card),
+            'aspect_ratio': card_image.width / card_image.height,
+            'dominant_colors': self.get_dominant_colors(processed_card),
+            'edge_features': self.extract_edge_features(processed_card)
         }
-
-    def classify_card_type_by_color(self, colors: np.ndarray) -> str:
-        """Classify Pokemon card type based on border/dominant colors."""
-        # Common Pokemon card type colors (approximate RGB values)
-        type_colors = {
-            'fire': ([255, 100, 100], [200, 50, 50]),  # Red
-            'water': ([100, 150, 255], [50, 100, 200]),  # Blue
-            'grass': ([100, 200, 100], [50, 150, 50]),  # Green
-            'electric': ([255, 255, 100], [200, 200, 50]),  # Yellow
-            'psychic': ([200, 100, 255], [150, 50, 200]),  # Purple
-            'fighting': ([200, 150, 100], [150, 100, 50]),  # Brown
-            'darkness': ([100, 100, 100], [50, 50, 50]),  # Dark gray
-            'metal': ([200, 200, 200], [150, 150, 150]),  # Light gray
-            'fairy': ([255, 200, 255], [200, 150, 200]),  # Pink
-            'dragon': ([255, 200, 100], [200, 150, 50]),  # Gold
-            'colorless': ([240, 240, 240], [200, 200, 200])  # Near white
-        }
-
-        best_match = 'unknown'
-        best_score = float('inf')
-
-        for color in colors[:3]:  # Check top 3 dominant colors
-            for card_type, (target_high, target_low) in type_colors.items():
-                # Calculate distance to both high and low variants
-                dist_high = np.linalg.norm(color - np.array(target_high))
-                dist_low = np.linalg.norm(color - np.array(target_low))
-                dist = min(dist_high, dist_low)
-
-                if dist < best_score:
-                    best_score = dist
-                    best_match = card_type
-
-        return best_match if best_score < 100 else 'unknown'
-
-    def detect_card_features(self, card_image: Image.Image) -> Dict[str, any]:
-        """Detect visual features of the card."""
-        # Convert to OpenCV format
-        cv_image = cv2.cvtColor(np.array(card_image), cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-
-        features = {}
-
-        # Detect if card has holographic/shiny effects
-        features['has_holo_effect'] = self.detect_holographic_effect(gray)
-
-        # Detect text regions (even if we can't read them well)
-        features['text_regions'] = self.detect_text_regions(gray)
-
-        # Calculate image hash for potential matching
-        features['image_hash'] = self.calculate_image_hash(card_image)
-
-        # Analyze card layout
-        features['layout_type'] = self.analyze_card_layout(gray)
 
         return features
 
-    def detect_holographic_effect(self, gray_image: np.ndarray) -> bool:
-        """Detect if the card has holographic/foil effects."""
-        # Holographic cards often have high variance in pixel intensity
-        # due to reflections and rainbow effects
+    def get_dominant_colors(self, image: Image.Image, num_colors: int = 5) -> List[Tuple[int, int, int]]:
+        """Get dominant colors using simple clustering."""
+        try:
+            # Convert to RGB and resize for speed
+            rgb_image = image.convert('RGB').resize((50, 50))
 
-        # Calculate local variance
-        kernel = np.ones((5, 5), np.float32) / 25
-        mean = cv2.filter2D(gray_image.astype(np.float32), -1, kernel)
-        variance = cv2.filter2D((gray_image.astype(np.float32) - mean) ** 2, -1, kernel)
+            # Get all pixels
+            pixels = list(rgb_image.getdata())
 
-        # High variance regions suggest holographic effects
-        high_variance_threshold = np.percentile(variance, 90)
-        high_variance_pixels = np.sum(variance > high_variance_threshold)
-        total_pixels = variance.size
+            # Simple color quantization - group similar colors
+            color_counts = {}
+            for r, g, b in pixels:
+                # Quantize to reduce similar colors
+                qr = (r // 32) * 32
+                qg = (g // 32) * 32
+                qb = (b // 32) * 32
+                key = (qr, qg, qb)
+                color_counts[key] = color_counts.get(key, 0) + 1
 
-        variance_ratio = high_variance_pixels / total_pixels
-        return variance_ratio > 0.05  # 5% of pixels have high variance
+            # Sort by frequency
+            sorted_colors = sorted(color_counts.items(), key=lambda x: x[1], reverse=True)
 
-    def detect_text_regions(self, gray_image: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        """Detect regions that likely contain text."""
-        # Use MSER (Maximally Stable Extremal Regions) to find text-like regions
-        mser = cv2.MSER_create()
-        regions, _ = mser.detectRegions(gray_image)
+            # Return top colors
+            return [color for color, count in sorted_colors[:num_colors]]
 
-        text_regions = []
-        for region in regions:
-            # Calculate bounding box
-            x, y, w, h = cv2.boundingRect(region.reshape(-1, 1, 2))
+        except Exception as e:
+            print(f"Error getting dominant colors: {e}")
+            return []
 
-            # Filter regions that are likely to be text
-            aspect_ratio = w / h if h > 0 else 0
-            area = w * h
+    def extract_edge_features(self, image: Image.Image) -> float:
+        """Extract edge density as a simple feature."""
+        try:
+            # Convert to OpenCV format
+            cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
 
-            # Text regions usually have reasonable aspect ratios and sizes
-            if 0.1 < aspect_ratio < 10 and 100 < area < 5000:
-                text_regions.append((x, y, w, h))
+            # Apply Canny edge detection
+            edges = cv2.Canny(gray, 50, 150)
 
-        return text_regions
+            # Calculate edge density
+            edge_pixels = np.sum(edges > 0)
+            total_pixels = edges.size
+            edge_density = edge_pixels / total_pixels if total_pixels > 0 else 0
 
-    def calculate_image_hash(self, image: Image.Image) -> str:
-        """Calculate a perceptual hash of the card image."""
-        # Resize to small size and convert to grayscale
-        small_image = image.resize((8, 8), Image.LANCZOS).convert('L')
-        pixels = list(small_image.getdata())
+            return edge_density
 
-        # Calculate average
-        avg = sum(pixels) / len(pixels)
+        except Exception as e:
+            print(f"Error extracting edge features: {e}")
+            return 0.0
 
-        # Create hash based on whether each pixel is above/below average
-        hash_bits = ''.join(['1' if pixel > avg else '0' for pixel in pixels])
+    def hamming_distance(self, hash1: str, hash2: str) -> int:
+        """Calculate Hamming distance between two hashes."""
+        if len(hash1) != len(hash2):
+            return float('inf')
 
-        # Convert to hex
-        hash_hex = hex(int(hash_bits, 2))[2:].zfill(16)
-        return hash_hex
+        return sum(c1 != c2 for c1, c2 in zip(hash1, hash2))
 
-    def analyze_card_layout(self, gray_image: np.ndarray) -> str:
-        """Analyze the overall layout of the card."""
-        height, width = gray_image.shape
+    def histogram_similarity(self, hist1: List[float], hist2: List[float]) -> float:
+        """Calculate histogram similarity (0-1, higher is more similar)."""
+        if not hist1 or not hist2 or len(hist1) != len(hist2):
+            return 0.0
 
-        # Divide into regions and analyze
-        top_region = gray_image[:height // 3, :]
-        middle_region = gray_image[height // 3:2 * height // 3, :]
-        bottom_region = gray_image[2 * height // 3:, :]
+        # Use chi-square distance
+        chi_square = 0
+        for h1, h2 in zip(hist1, hist2):
+            if h1 + h2 > 0:
+                chi_square += ((h1 - h2) ** 2) / (h1 + h2)
 
-        # Calculate average intensity for each region
-        top_avg = np.mean(top_region)
-        middle_avg = np.mean(middle_region)
-        bottom_avg = np.mean(bottom_region)
+        # Convert to similarity (0-1)
+        similarity = 1 / (1 + chi_square)
+        return similarity
 
-        # Classify based on intensity distribution
-        if middle_avg < top_avg and middle_avg < bottom_avg:
-            return 'pokemon_card'  # Typical Pokemon card has darker middle (artwork)
-        elif top_avg > middle_avg > bottom_avg:
-            return 'trainer_card'  # Might be a trainer card
-        else:
-            return 'unknown_layout'
+    def find_matching_card_in_database(self, features: Dict) -> Optional[Dict]:
+        """Find matching card in local database."""
+        if not self.card_database:
+            return None
 
-    def search_card_by_features(self, features: Dict) -> Optional[Dict]:
-        """Search for card using visual features instead of OCR text."""
+        best_match = None
+        best_score = 0
+
+        for card_id, stored_card in self.card_database.items():
+            if 'features' not in stored_card:
+                continue
+
+            stored_features = stored_card['features']
+            score = 0
+
+            # Compare perceptual hash
+            if features.get('perceptual_hash') and stored_features.get('perceptual_hash'):
+                hash_distance = self.hamming_distance(
+                    features['perceptual_hash'],
+                    stored_features['perceptual_hash']
+                )
+                hash_similarity = max(0, 1 - (hash_distance / 64))  # Normalize to 0-1
+                score += hash_similarity * 0.4
+
+            # Compare color histogram
+            if features.get('color_histogram') and stored_features.get('color_histogram'):
+                hist_similarity = self.histogram_similarity(
+                    features['color_histogram'],
+                    stored_features['color_histogram']
+                )
+                score += hist_similarity * 0.3
+
+            # Compare dominant colors
+            if features.get('dominant_colors') and stored_features.get('dominant_colors'):
+                color_similarity = self.compare_dominant_colors(
+                    features['dominant_colors'],
+                    stored_features['dominant_colors']
+                )
+                score += color_similarity * 0.2
+
+            # Compare edge features
+            if features.get('edge_features') is not None and stored_features.get('edge_features') is not None:
+                edge_diff = abs(features['edge_features'] - stored_features['edge_features'])
+                edge_similarity = max(0, 1 - edge_diff)
+                score += edge_similarity * 0.1
+
+            if score > best_score and score > 0.6:  # Threshold for matches
+                best_score = score
+                best_match = {
+                    'card_data': stored_card,
+                    'similarity_score': score
+                }
+
+        return best_match
+
+    def compare_dominant_colors(self, colors1: List[Tuple[int, int, int]],
+                                colors2: List[Tuple[int, int, int]]) -> float:
+        """Compare dominant color lists."""
+        if not colors1 or not colors2:
+            return 0.0
+
+        total_similarity = 0
+        comparisons = 0
+
+        for c1 in colors1[:3]:  # Compare top 3 colors
+            best_match = 0
+            for c2 in colors2[:3]:
+                # Calculate color distance
+                distance = sum((a - b) ** 2 for a, b in zip(c1, c2)) ** 0.5
+                similarity = max(0, 1 - (distance / (255 * 3 ** 0.5)))
+                best_match = max(best_match, similarity)
+
+            total_similarity += best_match
+            comparisons += 1
+
+        return total_similarity / comparisons if comparisons > 0 else 0
+
+    def search_pokemon_api_by_set_and_number(self, set_code: str, number: str) -> Optional[Dict]:
+        """Search for card by set and number if we can identify them."""
         if self.offline_mode:
             return None
 
         try:
-            # For now, we'll do a broad search and let the user manually verify
-            # In a real implementation, you might:
-            # 1. Use image similarity matching
-            # 2. Build a database of card hashes
-            # 3. Use machine learning for card recognition
+            time.sleep(self.api_delay)
+            params = {
+                'q': f'set.id:{set_code} number:{number}',
+                'select': 'name,number,set,types,cardmarket,images,hp,attacks'
+            }
 
-            # Search for cards of the detected type
-            estimated_type = features.get('estimated_type', '')
-            if estimated_type and estimated_type != 'unknown':
-                params = {
-                    'q': f'types:{estimated_type}',
-                    'select': 'name,number,set,types,cardmarket',
-                    'pageSize': 5  # Just get a few examples
-                }
+            response = requests.get(self.api_base_url, params=params, timeout=10)
+            response.raise_for_status()
 
-                response = requests.get(self.api_base_url, params=params, timeout=10)
-                response.raise_for_status()
-
-                data = response.json()
-                if data.get('data'):
-                    # Return the first match as an example
-                    # In practice, you'd want better matching logic
-                    return data['data'][0]
+            data = response.json()
+            if data.get('data'):
+                return data['data'][0]
 
         except Exception as e:
-            print(f"Error searching by features: {e}")
+            print(f"Error searching API: {e}")
 
         return None
 
+    def get_random_sample_cards(self, card_type: str = None, page_size: int = 20) -> List[Dict]:
+        """Get random sample cards to build database."""
+        if self.offline_mode:
+            return []
+
+        try:
+            time.sleep(self.api_delay)
+            params = {
+                'select': 'name,number,set,types,cardmarket,images,hp,attacks',
+                'pageSize': page_size
+            }
+
+            if card_type:
+                params['q'] = f'types:{card_type}'
+
+            response = requests.get(self.api_base_url, params=params, timeout=10)
+            response.raise_for_status()
+
+            data = response.json()
+            return data.get('data', [])
+
+        except Exception as e:
+            print(f"Error getting sample cards: {e}")
+            return []
+
     def process_cards(self, image_path: str, output_dir: str) -> List[Dict]:
-        """Process all cards using visual analysis instead of OCR."""
+        """Process all cards using image matching approach."""
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
         print("Splitting image into individual cards...")
@@ -270,6 +386,15 @@ class PokemonVisualScanner:
 
         results = []
 
+        # If database is empty, try to populate it with some samples
+        if not self.card_database and not self.offline_mode:
+            print("Building initial card database...")
+            sample_cards = self.get_random_sample_cards(page_size=50)
+            for card in sample_cards[:20]:  # Limit to avoid too many API calls
+                card_id = f"{card.get('set', {}).get('id', 'unknown')}_{card.get('number', 'unknown')}"
+                self.card_database[card_id] = card
+            self.save_card_database()
+
         for i, card_image in enumerate(cards, 1):
             print(f"Analyzing card {i}/9...")
 
@@ -278,41 +403,42 @@ class PokemonVisualScanner:
             card_path = os.path.join(output_dir, card_filename)
             card_image.save(card_path, 'JPEG', quality=95)
 
-            # Analyze visual features instead of OCR
-            color_analysis = self.analyze_card_colors(card_image)
-            visual_features = self.detect_card_features(card_image)
+            # Extract features
+            features = self.extract_card_features(card_image)
 
-            # Combine all analysis
+            # Try to find match in database
+            match_result = self.find_matching_card_in_database(features)
+
+            # Create card info
             card_info = {
                 'card_number': i,
                 'image_file': card_filename,
-                'estimated_type': color_analysis['estimated_type'],
-                'has_holo_effect': visual_features['has_holo_effect'],
-                'layout_type': visual_features['layout_type'],
-                'image_hash': visual_features['image_hash'],
-                'text_regions_count': len(visual_features['text_regions']),
-                'dominant_colors': str(color_analysis['dominant_colors']),
-                'name': f'Unknown Card {i}',  # Placeholder
-                'number': '',
-                'set': '',
-                'rarity': 'holo' if visual_features['has_holo_effect'] else 'unknown'
+                'perceptual_hash': features['perceptual_hash'],
+                'edge_density': features.get('edge_features', 0),
+                'dominant_colors': str(features.get('dominant_colors', [])),
+                'name': 'Unknown',
+                'set_name': '',
+                'card_type': '',
+                'hp': None,
+                'attacks': [],
+                'market_price': 0.0,
+                'similarity_score': 0.0
             }
 
-            # Try to get additional info if online
-            if not self.offline_mode:
-                print(f"  Searching for {color_analysis['estimated_type']} type cards...")
-                api_result = self.search_card_by_features({
-                    'estimated_type': color_analysis['estimated_type'],
-                    'has_holo_effect': visual_features['has_holo_effect']
+            if match_result:
+                matched_card = match_result['card_data']
+                card_info.update({
+                    'name': matched_card.get('name', 'Unknown'),
+                    'set_name': matched_card.get('set', {}).get('name', ''),
+                    'card_type': ', '.join(matched_card.get('types', [])),
+                    'hp': matched_card.get('hp'),
+                    'attacks': [att.get('name', '') for att in matched_card.get('attacks', [])],
+                    'market_price': matched_card.get('cardmarket', {}).get('prices', {}).get('averageSellPrice', 0.0),
+                    'similarity_score': match_result['similarity_score']
                 })
-
-                if api_result:
-                    card_info.update({
-                        'api_suggestion_name': api_result.get('name', ''),
-                        'api_suggestion_number': api_result.get('number', ''),
-                        'api_suggestion_set': api_result.get('set', {}).get('name', ''),
-                        'market_price': 0.0,  # Would need specific card lookup
-                    })
+                print(f"  Found match: {card_info['name']} (similarity: {card_info['similarity_score']:.2f})")
+            else:
+                print(f"  No match found - stored features for future use")
 
             results.append(card_info)
 
@@ -325,12 +451,10 @@ class PokemonVisualScanner:
             return
 
         headers = [
-            'card_number', 'image_file', 'estimated_type', 'has_holo_effect',
-            'layout_type', 'text_regions_count', 'rarity', 'image_hash'
+            'card_number', 'image_file', 'name', 'set_name', 'card_type',
+            'hp', 'market_price', 'similarity_score', 'perceptual_hash',
+            'edge_density', 'dominant_colors'
         ]
-
-        if not self.offline_mode:
-            headers.extend(['api_suggestion_name', 'api_suggestion_number', 'api_suggestion_set'])
 
         try:
             with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
@@ -338,7 +462,14 @@ class PokemonVisualScanner:
                 writer.writeheader()
 
                 for card in card_data:
-                    row = {header: card.get(header, '') for header in headers}
+                    row = {}
+                    for header in headers:
+                        value = card.get(header, '')
+                        # Convert list attacks to string for CSV
+                        if header == 'attacks' and isinstance(value, list):
+                            row['attacks'] = ', '.join(value)
+                        else:
+                            row[header] = value
                     writer.writerow(row)
 
             print(f"CSV saved to: {output_path}")
@@ -348,7 +479,7 @@ class PokemonVisualScanner:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Pokemon Card Visual Scanner')
+    parser = argparse.ArgumentParser(description='Pokemon Card Image Matching Scanner')
     parser.add_argument('input_image', help='Path to input image (3x3 grid of Pokemon cards)')
     parser.add_argument('output_dir', help='Output directory for cropped images and CSV')
     parser.add_argument('--offline', action='store_true',
@@ -360,36 +491,37 @@ def main():
         print(f"Error: Input image '{args.input_image}' not found")
         return 1
 
-    scanner = PokemonVisualScanner(offline_mode=args.offline)
+    scanner = PokemonImageScanner(offline_mode=args.offline)
 
     print(f"Processing image: {args.input_image}")
     print(f"Output directory: {args.output_dir}")
     print(f"Mode: {'Offline' if args.offline else 'Online'}")
-    print("Note: This version uses visual analysis instead of OCR")
+    print("Using image matching approach instead of OCR")
 
     card_data = scanner.process_cards(args.input_image, args.output_dir)
 
     if card_data:
-        csv_path = os.path.join(args.output_dir, 'pokemon_cards_visual.csv')
+        csv_path = os.path.join(args.output_dir, 'pokemon_cards_matched.csv')
         scanner.save_to_csv(card_data, csv_path)
 
         print(f"\nProcessing complete!")
         print(f"Analyzed {len(card_data)} cards")
         print(f"Images saved to: {args.output_dir}")
-        print(f"Analysis saved to: {csv_path}")
+        print(f"Results saved to: {csv_path}")
 
-        # Show summary of detected types
-        type_counts = {}
-        holo_count = 0
-        for card in card_data:
-            card_type = card.get('estimated_type', 'unknown')
-            type_counts[card_type] = type_counts.get(card_type, 0) + 1
-            if card.get('has_holo_effect'):
-                holo_count += 1
+        # Show summary
+        matches_found = sum(1 for card in card_data if card.get('similarity_score', 0) > 0)
+        avg_similarity = np.mean(
+            [card.get('similarity_score', 0) for card in card_data if card.get('similarity_score', 0) > 0])
 
-        print(f"\nDetected card types: {dict(type_counts)}")
-        print(f"Holographic cards detected: {holo_count}")
-        print(f"\nNote: Card names need manual verification or better image recognition")
+        print(f"\nMatches found: {matches_found}/{len(card_data)}")
+        if matches_found > 0:
+            print(f"Average similarity score: {avg_similarity:.2f}")
+
+        print(f"\nTo improve results:")
+        print(f"1. Run multiple times to build up card database")
+        print(f"2. Ensure good lighting and minimal glare in photos")
+        print(f"3. Cards should be clearly visible and unobstructed")
     else:
         print("No cards processed successfully")
         return 1
