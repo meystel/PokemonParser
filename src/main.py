@@ -119,10 +119,16 @@ class PokemonImageScanner:
 
         print(f"[DEBUG] OCR name candidates for {os.path.basename(card_image_path)}: {name_texts}")
 
+        """
+        #...Instead of smashing candidates together...
         raw_name = " ".join(name_texts).strip()
         name = self._clean_name(raw_name)
         if name:
             name = self.resolver.resolve(name)
+        """
+
+        # Send *all candidates* into the resolver to pick the best one
+        name = self.resolver.resolve_candidates(name_texts)
 
         card_number = ""
         for t in num_texts:
