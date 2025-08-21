@@ -74,28 +74,40 @@ class CardNameResolver:
         return ocr_text
 
     def resolve_candidates(self, candidates: list, threshold: int = 60) -> str:
-        """Resolve a list of OCR candidate strings to the best possible card name."""
+        """Resolve OCR candidate strings to the best possible card name."""
         if not candidates:
             return "Unknown"
 
-        # In offline mode: just pick the *longest candidate* (OCR often has multiple variants)
-        if not self.card_names:
-            return max(candidates, key=lambda c: len(c.strip()), default="Unknown").strip()
+        normalized = [self.normalize(c) for c in candidates if c.strip()]
 
+        # 1. Exact match first
+        for cand in normalized:
+            for known in self.card_names:
+                if cand == self.normalize(known):
+                    return known
+
+        # 2. Require that all significant tokens appear in candidate matches
+        tokens = [t for cand in normalized for t in cand.split() if len(t) > 2]
+        filtered_names = []
+        for name in self.card_names:
+            norm_name = self.normalize(name)
+            if all(tok in norm_name for tok in tokens if tok not in {"vmax", "vstar", "ex", "gx"}):
+                filtered_names.append(name)
+
+        if not filtered_names:
+            filtered_names = self.card_names  # fallback if filter kills everything
+
+        # 3. Fuzzy match within the filtered pool
         best_score = 0
         best_match = "Unknown"
-
-        for cand in candidates:
-            norm = self.normalize(cand)
-            if not norm:
-                continue
-
-            result = process.extractOne(norm, self.card_names, scorer=fuzz.WRatio)
+        for cand in normalized:
+            result = process.extractOne(cand, filtered_names, scorer=fuzz.WRatio)
             if result:
                 match, score, _ = result
-                # Add a slight preference for longer names
-                score += len(norm) * 0.2
-                if match and score >= threshold and score > best_score:
+                # Penalize if base species doesn't align (e.g. Steelix vs Dark Steelix)
+                if cand in self.normalize(match):
+                    score += 10
+                if score >= threshold and score > best_score:
                     best_score = score
                     best_match = match
 
